@@ -2,16 +2,20 @@
   ME NETWORK READOUT
   CC: Tweaked + Advanced Peripherals
 
-  Reads a real AE2 network through an ME Bridge and prints the
-  numbers that matter to a monitor. The computer does not need to
-  touch the controller -- everything is reached over wired modems.
+  Works with both ME Bridge APIs:
 
-  Every ME Bridge method returns "value, errorString". A failed call
-  returns nil plus a message instead of throwing, so this script
-  captures both and shows you the message rather than guessing.
+    legacy (AP 0.7, MC 1.20.1 and older)
+      getEnergyStorage / getMaxEnergyStorage / getCraftingCPUs
+      listItems()
 
-  Layout picks the largest text scale that still fits and re-fits
-  itself if monitor blocks are added or removed while running.
+    modern (AP 0.8, and 0.7 on MC 1.21.1+)
+      getStoredEnergy / getEnergyCapacity / getCraftingTasks
+      listItems({})   -- now takes a filter
+      isConnected() / isOnline()
+
+  The script detects which one the bridge exposes and calls the
+  matching names. Every call returns "value, errorString" on
+  failure rather than throwing, so both are captured.
 
   Ctrl+T to stop.
 ]]
@@ -26,17 +30,14 @@ local CONFIG = {
   pollInterval = 3,     -- seconds between network reads
   countTypes   = true,  -- false on very large networks (listItems is slow)
   typesEvery   = 5,     -- refresh the type count every N polls
-  energyLabel  = "AE",  -- AE2 reports AE, not FE
-  debug        = true,  -- print every failed call to the computer terminal
+  energyLabel  = "AE",  -- AE2 reports AE
+  debug        = true,  -- print failed calls to the computer terminal
 }
 
--- Smallest layout the full readout needs, in characters.
 local MIN_W, MIN_H = 26, 12
 
 --==========================================================
--- COLOURS
--- Slots are powers of two, defined here so the script does not
--- depend on the colors/colours API tables existing.
+-- COLOURS  (slots are powers of two)
 --==========================================================
 
 local WHITE, ORANGE, YELLOW, LIME  = 1, 2, 16, 32
@@ -52,56 +53,87 @@ if not mon then
   error("No monitor found. Check the modems on both ends are switched on (red).", 0)
 end
 
--- Below MC 1.21.1 the peripheral type is "meBridge".
--- On 1.21.1 and above it is "me_bridge".
 local bridge, bridgeType
 if CONFIG.bridgeName then
   bridge = peripheral.wrap(CONFIG.bridgeName)
   bridgeType = bridge and peripheral.getType(CONFIG.bridgeName) or nil
 else
+  -- "meBridge" below MC 1.21.1, "me_bridge" on 1.21.1 and above
   for _, t in ipairs({ "meBridge", "me_bridge" }) do
     local b = peripheral.find(t)
     if b then bridge, bridgeType = b, t break end
   end
 end
 
+if not bridge then
+  error("No ME Bridge on the peripheral network. Switch the modems on (red).", 0)
+end
+
+--==========================================================
+-- API DETECTION
+--==========================================================
+
+local has = function(name) return type(bridge[name]) == "function" end
+
+local API, M
+
+if has("getStoredEnergy") then
+  API = "0.8"
+  M = {
+    energy      = "getStoredEnergy",
+    energyMax   = "getEnergyCapacity",
+    usage       = "getEnergyUsage",
+    itemUsed    = "getUsedItemStorage",
+    itemTotal   = "getTotalItemStorage",
+    fluidUsed   = "getUsedFluidStorage",
+    fluidTotal  = "getTotalFluidStorage",
+    listItems   = "listItems",
+    listArgs    = {},          -- modern listItems needs a filter table
+    tasks       = "getCraftingTasks",
+    cpus        = nil,
+  }
+elseif has("getEnergyStorage") then
+  API = "0.7"
+  M = {
+    energy      = "getEnergyStorage",
+    energyMax   = "getMaxEnergyStorage",
+    usage       = "getEnergyUsage",
+    itemUsed    = "getUsedItemStorage",
+    itemTotal   = "getTotalItemStorage",
+    fluidUsed   = "getUsedFluidStorage",
+    fluidTotal  = "getTotalFluidStorage",
+    listItems   = "listItems",
+    listArgs    = nil,         -- legacy listItems takes no argument
+    tasks       = nil,
+    cpus        = "getCraftingCPUs",
+  }
+else
+  error("Bridge exposes neither getStoredEnergy nor getEnergyStorage. "
+        .. "Run the probe script to list its methods.", 0)
+end
+
 --==========================================================
 -- CALLING THE BRIDGE
---
--- AP methods are documented as:  method() -> value, err: string
--- A failure returns nil plus a message, it does NOT throw. So we
--- must capture both return values, and separately guard against a
--- genuine Lua error with pcall.
 --==========================================================
 
 local lastError = nil
 
 local function call(name, ...)
-  if not bridge then
-    return nil, "no ME Bridge on the peripheral network"
-  end
-
+  if not name then return nil, "not supported by this API" end
   local fn = bridge[name]
   if type(fn) ~= "function" then
     return nil, name .. " is not available in this AP version"
   end
-
   local ok, value, err = pcall(fn, ...)
-
   if not ok then
-    -- the call threw; `value` holds the Lua error message
     return nil, name .. " threw: " .. tostring(value)
   end
-
   if value == nil then
-    -- the documented failure path: nil + reason
     return nil, name .. ": " .. tostring(err or "returned nil with no reason")
   end
-
   return value
 end
 
--- Convenience wrapper that records the reason a call failed.
 local function get(name, ...)
   local value, err = call(name, ...)
   if value == nil and err then
@@ -113,12 +145,9 @@ end
 
 --==========================================================
 -- SCALING
--- CC accepts text scales from 0.5 to 5 in steps of 0.5. Walk them
--- from largest down and keep the first that fits the layout.
 --==========================================================
 
 local SCALES = { 5, 4.5, 4, 3.5, 3, 2.5, 2, 1.5, 1, 0.5 }
-
 local W, H, SCALE
 
 local function fitScale()
@@ -140,12 +169,11 @@ end
 --==========================================================
 
 local data = {
-  ok = false,
-  err = "connecting",
+  ok = false, err = "connecting",
   energy = 0, energyMax = 0, usage = 0,
   hasItemStats = false, itemUsed = 0, itemTotal = 0,
   hasFluidStats = false, fluidUsed = 0, fluidTotal = 0,
-  cpuTotal = 0, cpuBusy = 0,
+  jobs = 0, jobLabel = "Crafting", jobTotal = nil,
   types = nil,
 }
 
@@ -154,43 +182,68 @@ local pollCount = 0
 local function poll()
   lastError = nil
 
-  local energy, err = call("getEnergyStorage")
+  -- The modern API can be asked directly whether the grid is up.
+  if has("isOnline") then
+    local ok, err = call("isOnline")
+    if ok == nil then
+      data.ok, data.err = false, err or "isOnline failed"
+      if CONFIG.debug then print("[bridge] " .. data.err) end
+      return
+    end
+    if ok == false then
+      local conn = call("isConnected")
+      data.ok = false
+      data.err = (conn == false)
+        and "bridge is not connected to a grid"
+        or  "grid is offline (no power?)"
+      return
+    end
+  end
+
+  local energy, err = call(M.energy)
   if energy == nil then
-    data.ok = false
-    data.err = err or "unknown failure"
+    data.ok, data.err = false, err or "unknown failure"
     if CONFIG.debug then print("[bridge] " .. data.err) end
     return
   end
 
-  data.ok = true
-  data.err = nil
+  data.ok, data.err = true, nil
   data.energy    = energy
-  data.energyMax = get("getMaxEnergyStorage") or 0
-  data.usage     = get("getEnergyUsage") or 0
+  data.energyMax = get(M.energyMax) or 0
+  data.usage     = get(M.usage) or 0
 
-  local iu = get("getUsedItemStorage")
-  local it = get("getTotalItemStorage")
+  local iu, it = get(M.itemUsed), get(M.itemTotal)
   data.hasItemStats = (iu ~= nil and it ~= nil and it > 0)
   data.itemUsed, data.itemTotal = iu or 0, it or 0
 
-  local fu = get("getUsedFluidStorage")
-  local ft = get("getTotalFluidStorage")
+  local fu, ft = get(M.fluidUsed), get(M.fluidTotal)
   data.hasFluidStats = (fu ~= nil and ft ~= nil and ft > 0)
   data.fluidUsed, data.fluidTotal = fu or 0, ft or 0
 
-  local cpus = get("getCraftingCPUs")
-  if type(cpus) == "table" then
-    data.cpuTotal = #cpus
-    local busy = 0
-    for _, c in ipairs(cpus) do
-      if c.isBusy then busy = busy + 1 end
+  -- Crafting: the modern API lists running tasks, the legacy one
+  -- lists CPUs and marks which are busy.
+  if M.tasks then
+    local tasks = get(M.tasks)
+    data.jobs     = (type(tasks) == "table") and #tasks or 0
+    data.jobLabel = "Crafting jobs"
+    data.jobTotal = nil
+  elseif M.cpus then
+    local cpus = get(M.cpus)
+    if type(cpus) == "table" then
+      local busy = 0
+      for _, c in ipairs(cpus) do
+        if c.isBusy then busy = busy + 1 end
+      end
+      data.jobs, data.jobTotal = busy, #cpus
     end
-    data.cpuBusy = busy
+    data.jobLabel = "Crafting CPUs"
   end
 
   pollCount = pollCount + 1
   if CONFIG.countTypes and (pollCount % CONFIG.typesEvery == 1) then
-    local items = get("listItems")
+    local items
+    if M.listArgs then items = get(M.listItems, M.listArgs)
+    else items = get(M.listItems) end
     if type(items) == "table" then data.types = #items end
   end
 end
@@ -257,8 +310,6 @@ local function rule(y)
   at(2, y, string.rep("-", W - 2), GRAY)
 end
 
--- Wraps a message across the remaining rows so long bridge errors
--- are readable instead of cut off at the edge.
 local function wrapText(y, text, colour)
   local width = W - 2
   local i = 1
@@ -278,7 +329,7 @@ local function render()
 
   local status, scol
   if not data.ok then status, scol = "OFFLINE", RED
-  elseif data.cpuBusy > 0 then status, scol = "CRAFTING", YELLOW
+  elseif data.jobs > 0 then status, scol = "CRAFTING", YELLOW
   else status, scol = "ONLINE", LIME end
   row(y, "ME NETWORK", status, ORANGE, scol)
   y = y + 1
@@ -306,9 +357,6 @@ local function render()
     bar(y + 1, p, loadColour(p))
     row(y + 2, "Bytes", fmt(data.itemUsed) .. " / " .. fmt(data.itemTotal))
     y = y + 4
-  elseif y <= H then
-    row(y, "Item cells", "unsupported", LIGHTGRAY, GRAY)
-    y = y + 2
   end
 
   if data.hasFluidStats and y + 2 <= H then
@@ -322,9 +370,10 @@ local function render()
 
   if y <= H then rule(y); y = y + 1 end
   if y <= H then
-    row(y, "Crafting CPUs",
-        string.format("%d / %d", data.cpuBusy, data.cpuTotal),
-        LIGHTGRAY, data.cpuBusy > 0 and YELLOW or WHITE)
+    local v = data.jobTotal
+      and string.format("%d / %d", data.jobs, data.jobTotal)
+      or  tostring(data.jobs)
+    row(y, data.jobLabel, v, LIGHTGRAY, data.jobs > 0 and YELLOW or WHITE)
     y = y + 1
   end
   if data.types and y <= H then
@@ -347,7 +396,7 @@ term.clear()
 term.setCursorPos(1, 1)
 print("ME Network Readout")
 print("Monitor: " .. W .. "x" .. H .. " at scale " .. SCALE)
-print("Bridge:  " .. (bridge and ("found as " .. tostring(bridgeType)) or "MISSING"))
+print("Bridge:  " .. tostring(bridgeType) .. "  (API " .. API .. ")")
 print("Ctrl+T to stop.")
 print("")
 
@@ -361,8 +410,7 @@ end
 
 local function resizeLoop()
   while true do
-    local ev = os.pullEvent()
-    if ev == "monitor_resize" then
+    if os.pullEvent() == "monitor_resize" then
       fitScale()
       render()
     end
