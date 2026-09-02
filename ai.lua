@@ -1,164 +1,127 @@
 --[[
-  HEX GRID
-  Fills an Advanced Monitor with random hex values.
-  Each value is a whole token coloured a single shade -- gray, green
-  or dark red -- so the screen reads as a data dump rather than noise.
-
-  Only a fraction of rows are rerolled each frame (see CONFIG.churn),
-  which makes it look like values updating instead of static.
-
-  All colour constants are defined locally below, so this does not
-  depend on the colors/colours API tables being present.
+  ME CONTROLLER - PROCESSING DISPLAY
+  Drives four Advanced Monitors (left, right, back, front) with
+  random hex traffic and a header that reads as the controller
+  working. Purely decorative -- it does not read the real network.
 
   Ctrl+T to stop.
 ]]
-
---==========================================================
--- COLOUR CONSTANTS
--- CC colour slots are powers of two. Defining them here means
--- the script never touches the colors/colours tables.
---==========================================================
-
-local COLOUR = {
-  white     = 1,
-  orange    = 2,
-  magenta   = 4,
-  lightBlue = 8,
-  yellow    = 16,
-  lime      = 32,
-  pink      = 64,
-  gray      = 128,
-  lightGray = 256,
-  cyan      = 512,
-  purple    = 1024,
-  blue      = 2048,
-  brown     = 4096,
-  green     = 8192,
-  red       = 16384,
-  black     = 32768,
-}
-
--- CC's stock palette values, used to put the monitor back on exit.
-local DEFAULT_HEX = {
-  [COLOUR.gray]  = 0x4C4C4C,
-  [COLOUR.green] = 0x57A64E,
-  [COLOUR.brown] = 0x7F664C,
-}
 
 --==========================================================
 -- CONFIG
 --==========================================================
 
 local CONFIG = {
-  side   = "right",   -- or nil to auto-detect
-  scale  = 0.5,       -- smallest CC allows
-  delay  = 0.15,      -- seconds per frame
-  churn  = 0.25,      -- fraction of rows redrawn per frame (0-1)
-  minLen = 2,         -- shortest hex value, in digits
-  maxLen = 4,         -- longest
-  maxGap = 3,         -- spaces between values
-  prefix = "",        -- set to "0x" to prefix each value
+  sides = { "left", "right", "back", "front" },
+  scale = 0.5,
+  delay = 0.1,    -- seconds per frame
+  churn = 0.3,    -- fraction of rows redrawn per frame
 }
 
--- The three shades this script paints with.
-local SHADE_HEX = {
-  [COLOUR.gray]  = 0x555555,   -- gray
-  [COLOUR.green] = 0x3fbf46,   -- green
-  [COLOUR.brown] = 0x7a1a12,   -- dark red
-}
+-- CC colour slots are powers of two. Defined here so the script
+-- never depends on the colors/colours tables.
+local BLACK, ORANGE, WHITE = 32768, 2, 1
+local GRAY, BROWN = 128, 4096
 
-local HEX = "0123456789ABCDEF"
+local CHARS = "0123456789ABCDEF"
+local SPIN  = { "|", "/", "-", "\\" }
 
---==========================================================
--- SETUP
---==========================================================
-
-local mon = CONFIG.side and peripheral.wrap(CONFIG.side) or peripheral.find("monitor")
-if not mon then error("No monitor found", 0) end
-if not mon.isColour or not mon.isColour() then
-  error("Needs an advanced (gold) monitor", 0)
-end
-
-mon.setTextScale(CONFIG.scale)
-
-for slot, hex in pairs(SHADE_HEX) do
-  mon.setPaletteColour(slot, hex)
-end
-
--- Weighted: repeat a blit code to make that shade commoner.
--- 7 = gray slot, d = green slot, c = brown slot (our dark red).
+-- blit codes for the slots we repaint below.
+-- 7 = gray slot, c = brown slot, 1 = orange slot, 0 = white slot.
 local SHADES = {
-  "7","7","7","7","7","7",  -- gray
-  "d","d","d",              -- green
-  "c","c",                  -- dark red
+  "7","7","7","7","7","7","7",  -- dim traffic
+  "c","c","c",                  -- warm traffic
+  "1","1",                      -- bright orange
+  "0",                          -- white flash
 }
 local NSHADES = #SHADES
 
-mon.setBackgroundColour(COLOUR.black)
-mon.clear()
-
-local w, h = mon.getSize()
-
 --==========================================================
--- ROW BUILDING
+-- FIND MONITORS
 --==========================================================
 
-local function buildRow()
+local screens = {}
+
+for _, side in ipairs(CONFIG.sides) do
+  local m = peripheral.wrap(side)
+  if m and m.setTextScale then
+    m.setTextScale(CONFIG.scale)
+    m.setPaletteColour(GRAY,   0x3a2a12)   -- dim amber
+    m.setPaletteColour(BROWN,  0x8a5a14)   -- mid amber
+    m.setPaletteColour(ORANGE, 0xf0a32a)   -- AE2 orange
+    m.setBackgroundColour(BLACK)
+    m.clear()
+    local w, h = m.getSize()
+    screens[#screens + 1] = { mon = m, side = side, w = w, h = h }
+  end
+end
+
+if #screens == 0 then
+  error("No monitors found on: " .. table.concat(CONFIG.sides, ", "), 0)
+end
+
+--==========================================================
+-- DRAWING
+--==========================================================
+
+local function randomRow(w)
   local t, f = {}, {}
-  local i = 1
-  while i <= w do
-    local shade = SHADES[math.random(1, NSHADES)]
-
-    local token = CONFIG.prefix
-    for _ = 1, math.random(CONFIG.minLen, CONFIG.maxLen) do
-      local c = math.random(1, 16)
-      token = token .. HEX:sub(c, c)
-    end
-
-    for k = 1, #token do
-      if i > w then break end
-      t[i], f[i] = token:sub(k, k), shade
-      i = i + 1
-    end
-
-    for _ = 1, math.random(1, CONFIG.maxGap) do
-      if i > w then break end
-      t[i], f[i] = " ", shade
-      i = i + 1
-    end
+  for i = 1, w do
+    local c = math.random(1, 16)
+    t[i] = CHARS:sub(c, c)
+    -- gaps keep it from looking like a solid block of digits
+    if math.random() < 0.18 then t[i] = " " end
+    f[i] = SHADES[math.random(1, NSHADES)]
   end
   return table.concat(t), table.concat(f)
 end
 
--- Cache every row so partial redraws keep the rest of the screen intact.
-local rows = {}
-for y = 1, h do
-  local t, f = buildRow()
-  rows[y] = { t = t, f = f }
-end
+local function drawHeader(s, frame)
+  local spin = SPIN[(frame % #SPIN) + 1]
+  local text = " ME CONTROLLER  " .. spin .. " PROCESSING"
+  if #text > s.w then text = text:sub(1, s.w) end
+  text = text .. string.rep(" ", s.w - #text)
 
-local BG = string.rep("f", w)
+  s.mon.setCursorPos(1, 1)
+  s.mon.blit(text, string.rep("0", s.w), string.rep("1", s.w))
 
-local function drawRow(y)
-  mon.setCursorPos(1, y)
-  mon.blit(rows[y].t, rows[y].f, BG)
+  if s.h >= 2 then
+    s.mon.setCursorPos(1, 2)
+    s.mon.blit(string.rep(" ", s.w), string.rep("0", s.w), string.rep("f", s.w))
+  end
 end
 
 --==========================================================
 -- RUN
 --==========================================================
 
-for y = 1, h do drawRow(y) end
+for _, s in ipairs(screens) do
+  s.bg = string.rep("f", s.w)
+  for y = 3, s.h do
+    local t, f = randomRow(s.w)
+    s.mon.setCursorPos(1, y)
+    s.mon.blit(t, f, s.bg)
+  end
+end
 
-local perFrame = math.max(1, math.floor(h * CONFIG.churn))
+print("Driving " .. #screens .. " monitor(s):")
+for _, s in ipairs(screens) do print("  " .. s.side) end
+print("Ctrl+T to stop.")
+
+local frame = 0
 
 local ok, err = pcall(function()
   while true do
-    for _ = 1, perFrame do
-      local y = math.random(1, h)
-      local t, f = buildRow()
-      rows[y] = { t = t, f = f }
-      drawRow(y)
+    frame = frame + 1
+    for _, s in ipairs(screens) do
+      drawHeader(s, frame)
+      local rows = math.max(1, math.floor((s.h - 2) * CONFIG.churn))
+      for _ = 1, rows do
+        local y = math.random(3, math.max(3, s.h))
+        local t, f = randomRow(s.w)
+        s.mon.setCursorPos(1, y)
+        s.mon.blit(t, f, s.bg)
+      end
     end
     sleep(CONFIG.delay)
   end
@@ -168,12 +131,14 @@ end)
 -- RESTORE
 --==========================================================
 
-for slot, hex in pairs(DEFAULT_HEX) do
-  mon.setPaletteColour(slot, hex)
+for _, s in ipairs(screens) do
+  s.mon.setPaletteColour(GRAY,   0x4C4C4C)
+  s.mon.setPaletteColour(BROWN,  0x7F664C)
+  s.mon.setPaletteColour(ORANGE, 0xF2B233)
+  s.mon.setBackgroundColour(BLACK)
+  s.mon.setTextColour(WHITE)
+  s.mon.clear()
+  s.mon.setCursorPos(1, 1)
 end
-mon.setBackgroundColour(COLOUR.black)
-mon.setTextColour(COLOUR.white)
-mon.clear()
-mon.setCursorPos(1, 1)
 
 if not ok then printError(err) end
