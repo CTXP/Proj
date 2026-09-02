@@ -7,8 +7,47 @@
   Only a fraction of rows are rerolled each frame (see CONFIG.churn),
   which makes it look like values updating instead of static.
 
+  All colour constants are defined locally below, so this does not
+  depend on the colors/colours API tables being present.
+
   Ctrl+T to stop.
 ]]
+
+--==========================================================
+-- COLOUR CONSTANTS
+-- CC colour slots are powers of two. Defining them here means
+-- the script never touches the colors/colours tables.
+--==========================================================
+
+local COLOUR = {
+  white     = 1,
+  orange    = 2,
+  magenta   = 4,
+  lightBlue = 8,
+  yellow    = 16,
+  lime      = 32,
+  pink      = 64,
+  gray      = 128,
+  lightGray = 256,
+  cyan      = 512,
+  purple    = 1024,
+  blue      = 2048,
+  brown     = 4096,
+  green     = 8192,
+  red       = 16384,
+  black     = 32768,
+}
+
+-- CC's stock palette values, used to put the monitor back on exit.
+local DEFAULT_HEX = {
+  [COLOUR.gray]  = 0x4C4C4C,
+  [COLOUR.green] = 0x57A64E,
+  [COLOUR.brown] = 0x7F664C,
+}
+
+--==========================================================
+-- CONFIG
+--==========================================================
 
 local CONFIG = {
   side   = "right",   -- or nil to auto-detect
@@ -21,7 +60,18 @@ local CONFIG = {
   prefix = "",        -- set to "0x" to prefix each value
 }
 
+-- The three shades this script paints with.
+local SHADE_HEX = {
+  [COLOUR.gray]  = 0x555555,   -- gray
+  [COLOUR.green] = 0x3fbf46,   -- green
+  [COLOUR.brown] = 0x7a1a12,   -- dark red
+}
+
 local HEX = "0123456789ABCDEF"
+
+--==========================================================
+-- SETUP
+--==========================================================
 
 local mon = CONFIG.side and peripheral.wrap(CONFIG.side) or peripheral.find("monitor")
 if not mon then error("No monitor found", 0) end
@@ -31,11 +81,12 @@ end
 
 mon.setTextScale(CONFIG.scale)
 
-mon.setPaletteColour(colours.gray,  0x555555)  -- gray
-mon.setPaletteColour(colours.green, 0x3fbf46)  -- green
-mon.setPaletteColour(colours.brown, 0x7a1a12)  -- dark red
+for slot, hex in pairs(SHADE_HEX) do
+  mon.setPaletteColour(slot, hex)
+end
 
--- Weighted: repeat a code to make that shade commoner.
+-- Weighted: repeat a blit code to make that shade commoner.
+-- 7 = gray slot, d = green slot, c = brown slot (our dark red).
 local SHADES = {
   "7","7","7","7","7","7",  -- gray
   "d","d","d",              -- green
@@ -43,10 +94,14 @@ local SHADES = {
 }
 local NSHADES = #SHADES
 
-mon.setBackgroundColour(colours.black)
+mon.setBackgroundColour(COLOUR.black)
 mon.clear()
 
 local w, h = mon.getSize()
+
+--==========================================================
+-- ROW BUILDING
+--==========================================================
 
 local function buildRow()
   local t, f = {}, {}
@@ -89,6 +144,10 @@ local function drawRow(y)
   mon.blit(rows[y].t, rows[y].f, BG)
 end
 
+--==========================================================
+-- RUN
+--==========================================================
+
 for y = 1, h do drawRow(y) end
 
 local perFrame = math.max(1, math.floor(h * CONFIG.churn))
@@ -105,11 +164,15 @@ local ok, err = pcall(function()
   end
 end)
 
-for _, c in pairs({colours.gray, colours.green, colours.brown}) do
-  mon.setPaletteColour(c, term.nativePaletteColour(c))
+--==========================================================
+-- RESTORE
+--==========================================================
+
+for slot, hex in pairs(DEFAULT_HEX) do
+  mon.setPaletteColour(slot, hex)
 end
-mon.setBackgroundColour(colours.black)
-mon.setTextColour(colours.white)
+mon.setBackgroundColour(COLOUR.black)
+mon.setTextColour(COLOUR.white)
 mon.clear()
 mon.setCursorPos(1, 1)
 
