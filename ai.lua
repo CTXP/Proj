@@ -6,8 +6,12 @@
   numbers that matter to a monitor. The computer does not need to
   touch the controller -- everything is reached over wired modems.
 
-  The layout picks the largest text scale that still fits, and
-  re-fits itself if you add or remove monitor blocks while running.
+  Every ME Bridge method returns "value, errorString". A failed call
+  returns nil plus a message instead of throwing, so this script
+  captures both and shows you the message rather than guessing.
+
+  Layout picks the largest text scale that still fits and re-fits
+  itself if monitor blocks are added or removed while running.
 
   Ctrl+T to stop.
 ]]
@@ -22,7 +26,8 @@ local CONFIG = {
   pollInterval = 3,     -- seconds between network reads
   countTypes   = true,  -- false on very large networks (listItems is slow)
   typesEvery   = 5,     -- refresh the type count every N polls
-  energyLabel  = "FE",  -- older builds report AE, newer report FE
+  energyLabel  = "AE",  -- AE2 reports AE, not FE
+  debug        = true,  -- print every failed call to the computer terminal
 }
 
 -- Smallest layout the full readout needs, in characters.
@@ -30,7 +35,7 @@ local MIN_W, MIN_H = 26, 12
 
 --==========================================================
 -- COLOURS
--- Slots are powers of two. Defined here so the script does not
+-- Slots are powers of two, defined here so the script does not
 -- depend on the colors/colours API tables existing.
 --==========================================================
 
@@ -47,14 +52,69 @@ if not mon then
   error("No monitor found. Check the modems on both ends are switched on (red).", 0)
 end
 
-local bridge = CONFIG.bridgeName and peripheral.wrap(CONFIG.bridgeName)
-                or peripheral.find("meBridge")
+-- Below MC 1.21.1 the peripheral type is "meBridge".
+-- On 1.21.1 and above it is "me_bridge".
+local bridge, bridgeType
+if CONFIG.bridgeName then
+  bridge = peripheral.wrap(CONFIG.bridgeName)
+  bridgeType = bridge and peripheral.getType(CONFIG.bridgeName) or nil
+else
+  for _, t in ipairs({ "meBridge", "me_bridge" }) do
+    local b = peripheral.find(t)
+    if b then bridge, bridgeType = b, t break end
+  end
+end
+
+--==========================================================
+-- CALLING THE BRIDGE
+--
+-- AP methods are documented as:  method() -> value, err: string
+-- A failure returns nil plus a message, it does NOT throw. So we
+-- must capture both return values, and separately guard against a
+-- genuine Lua error with pcall.
+--==========================================================
+
+local lastError = nil
+
+local function call(name, ...)
+  if not bridge then
+    return nil, "no ME Bridge on the peripheral network"
+  end
+
+  local fn = bridge[name]
+  if type(fn) ~= "function" then
+    return nil, name .. " is not available in this AP version"
+  end
+
+  local ok, value, err = pcall(fn, ...)
+
+  if not ok then
+    -- the call threw; `value` holds the Lua error message
+    return nil, name .. " threw: " .. tostring(value)
+  end
+
+  if value == nil then
+    -- the documented failure path: nil + reason
+    return nil, name .. ": " .. tostring(err or "returned nil with no reason")
+  end
+
+  return value
+end
+
+-- Convenience wrapper that records the reason a call failed.
+local function get(name, ...)
+  local value, err = call(name, ...)
+  if value == nil and err then
+    lastError = err
+    if CONFIG.debug then print("[bridge] " .. err) end
+  end
+  return value
+end
 
 --==========================================================
 -- SCALING
 -- CC accepts text scales from 0.5 to 5 in steps of 0.5. Walk them
--- from largest down and keep the first that fits the layout, so a
--- big monitor gets big text instead of a wall of tiny characters.
+-- from largest down and keep the first that fits the layout.
 --==========================================================
 
 local SCALES = { 5, 4.5, 4, 3.5, 3, 2.5, 2, 1.5, 1, 0.5 }
@@ -70,8 +130,6 @@ local function fitScale()
       return
     end
   end
-  -- Monitor is too small for the full layout. Use the smallest text
-  -- and let the renderer drop sections it cannot fit.
   mon.setTextScale(0.5)
   SCALE = 0.5
   W, H = mon.getSize()
@@ -85,56 +143,54 @@ local data = {
   ok = false,
   err = "connecting",
   energy = 0, energyMax = 0, usage = 0,
-  itemUsed = 0, itemTotal = 0,
-  fluidUsed = 0, fluidTotal = 0,
+  hasItemStats = false, itemUsed = 0, itemTotal = 0,
+  hasFluidStats = false, fluidUsed = 0, fluidTotal = 0,
   cpuTotal = 0, cpuBusy = 0,
   types = nil,
 }
 
-local function call(name, ...)
-  if not bridge or type(bridge[name]) ~= "function" then return nil end
-  local ok, res = pcall(bridge[name], ...)
-  if ok then return res end
-  return nil
-end
-
 local pollCount = 0
 
 local function poll()
-  if not bridge then
-    data.ok, data.err = false, "no ME Bridge on the network"
+  lastError = nil
+
+  local energy, err = call("getEnergyStorage")
+  if energy == nil then
+    data.ok = false
+    data.err = err or "unknown failure"
+    if CONFIG.debug then print("[bridge] " .. data.err) end
     return
   end
 
-  local e = call("getEnergyStorage")
-  if e == nil then
-    data.ok, data.err = false, "bridge has no channel"
-    return
-  end
+  data.ok = true
+  data.err = nil
+  data.energy    = energy
+  data.energyMax = get("getMaxEnergyStorage") or 0
+  data.usage     = get("getEnergyUsage") or 0
 
-  data.ok        = true
-  data.energy    = e or 0
-  data.energyMax = call("getMaxEnergyStorage") or 0
-  data.usage     = call("getEnergyUsage") or call("getAvgPowerUsage") or 0
+  local iu = get("getUsedItemStorage")
+  local it = get("getTotalItemStorage")
+  data.hasItemStats = (iu ~= nil and it ~= nil and it > 0)
+  data.itemUsed, data.itemTotal = iu or 0, it or 0
 
-  data.itemUsed   = call("getUsedItemStorage")   or 0
-  data.itemTotal  = call("getTotalItemStorage")  or 0
-  data.fluidUsed  = call("getUsedFluidStorage")  or 0
-  data.fluidTotal = call("getTotalFluidStorage") or 0
+  local fu = get("getUsedFluidStorage")
+  local ft = get("getTotalFluidStorage")
+  data.hasFluidStats = (fu ~= nil and ft ~= nil and ft > 0)
+  data.fluidUsed, data.fluidTotal = fu or 0, ft or 0
 
-  local cpus = call("getCraftingCPUs")
+  local cpus = get("getCraftingCPUs")
   if type(cpus) == "table" then
     data.cpuTotal = #cpus
     local busy = 0
     for _, c in ipairs(cpus) do
-      if c.isBusy or c.busy then busy = busy + 1 end
+      if c.isBusy then busy = busy + 1 end
     end
     data.cpuBusy = busy
   end
 
   pollCount = pollCount + 1
   if CONFIG.countTypes and (pollCount % CONFIG.typesEvery == 1) then
-    local items = call("listItems")
+    local items = get("listItems")
     if type(items) == "table" then data.types = #items end
   end
 end
@@ -175,8 +231,6 @@ local function at(x, y, text, fg, bg)
   mon.write(text)
 end
 
--- Writes a label on the left and a value on the right of the same row,
--- padding the middle so old text is always cleared.
 local function row(y, label, value, lc, vc)
   local pad = W - 2 - #label - #value
   if pad < 1 then
@@ -203,13 +257,25 @@ local function rule(y)
   at(2, y, string.rep("-", W - 2), GRAY)
 end
 
+-- Wraps a message across the remaining rows so long bridge errors
+-- are readable instead of cut off at the edge.
+local function wrapText(y, text, colour)
+  local width = W - 2
+  local i = 1
+  while i <= #text and y <= H do
+    at(2, y, text:sub(i, i + width - 1), colour)
+    i = i + width
+    y = y + 1
+  end
+  return y
+end
+
 local function render()
   mon.setBackgroundColour(BLACK)
   mon.clear()
 
   local y = 1
 
-  -- header
   local status, scol
   if not data.ok then status, scol = "OFFLINE", RED
   elseif data.cpuBusy > 0 then status, scol = "CRAFTING", YELLOW
@@ -220,11 +286,11 @@ local function render()
   if y <= H then rule(y); y = y + 1 end
 
   if not data.ok then
-    if y <= H then at(2, y + 1, data.err:sub(1, W - 2), RED) end
+    y = y + 1
+    wrapText(y, data.err or "unknown failure", RED)
     return
   end
 
-  -- energy
   if y + 2 <= H then
     local p = pct(data.energy, data.energyMax)
     row(y, "Energy", fmt(data.energy) .. " " .. CONFIG.energyLabel)
@@ -233,18 +299,19 @@ local function render()
     y = y + 4
   end
 
-  -- item cells
-  if y + 2 <= H then
+  if data.hasItemStats and y + 2 <= H then
     local p = pct(data.itemUsed, data.itemTotal)
     row(y, "Item cells", string.format("%d%%", math.floor(p * 100 + 0.5)),
         LIGHTGRAY, loadColour(p))
     bar(y + 1, p, loadColour(p))
     row(y + 2, "Bytes", fmt(data.itemUsed) .. " / " .. fmt(data.itemTotal))
     y = y + 4
+  elseif y <= H then
+    row(y, "Item cells", "unsupported", LIGHTGRAY, GRAY)
+    y = y + 2
   end
 
-  -- fluid cells, only if the network has any
-  if data.fluidTotal > 0 and y + 2 <= H then
+  if data.hasFluidStats and y + 2 <= H then
     local p = pct(data.fluidUsed, data.fluidTotal)
     row(y, "Fluid cells", string.format("%d%%", math.floor(p * 100 + 0.5)),
         LIGHTGRAY, loadColour(p))
@@ -253,7 +320,6 @@ local function render()
     y = y + 4
   end
 
-  -- footer
   if y <= H then rule(y); y = y + 1 end
   if y <= H then
     row(y, "Crafting CPUs",
@@ -263,6 +329,10 @@ local function render()
   end
   if data.types and y <= H then
     row(y, "Item types", fmt(data.types))
+    y = y + 1
+  end
+  if lastError and y <= H then
+    at(2, y, lastError:sub(1, W - 2), GRAY)
   end
 end
 
@@ -277,8 +347,9 @@ term.clear()
 term.setCursorPos(1, 1)
 print("ME Network Readout")
 print("Monitor: " .. W .. "x" .. H .. " at scale " .. SCALE)
-print("Bridge:  " .. (bridge and "found" or "MISSING"))
+print("Bridge:  " .. (bridge and ("found as " .. tostring(bridgeType)) or "MISSING"))
 print("Ctrl+T to stop.")
+print("")
 
 local function pollLoop()
   while true do
@@ -288,7 +359,6 @@ local function pollLoop()
   end
 end
 
--- Re-fit when monitor blocks are added or removed.
 local function resizeLoop()
   while true do
     local ev = os.pullEvent()
